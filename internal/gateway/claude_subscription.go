@@ -139,7 +139,22 @@ const (
 	claudeCacheTTL = time.Hour
 	idleLongest    = claudeCacheTTL
 	idleMost       = 6
+	// idleBusy is how many of the user's claudeRunsMost are left for runs
+	// that are answering, when the idle runs are sized from it (idleCap)
+	idleBusy = 4
 )
+
+// idleCap is how many idle runs are kept: with the user's claudeRunsMost
+// set, all of it but idleBusy, idleMost at least and claudeRunsMost at
+// most (an idle run holds about 40 MB, and 6 of 32 let a conversation go
+// to a new Claude Code that told it again); with it on auto, idleMost.
+func idleCap() int {
+	n := settings.Load().ClaudeRunsMost
+	if n <= 0 {
+		return idleMost
+	}
+	return min(max(n-idleBusy, idleMost), n)
+}
 
 // parkLongest is how long a run started anew for each turn (Cursor)
 // waits on its caller's tool results. A caller that quit, or was stopped,
@@ -2467,7 +2482,8 @@ func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) bool
 	if conv != "" {
 		r.convKey = conv
 	}
-	for len(b.idle) > idleMost {
+	most := idleCap()
+	for len(b.idle) > most {
 		var oldKey string
 		var oldest *subscriptionRun
 		for k, run := range b.idle {
@@ -2487,7 +2503,7 @@ func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) bool
 	}
 	b.mu.Unlock()
 	for _, run := range drop {
-		run.abortFor("another run was kept in its place (" + strconv.Itoa(idleMost) + " wait at most)")
+		run.abortFor("another run was kept in its place (" + strconv.Itoa(most) + " wait at most)")
 	}
 	claudeRoom.nudge() // an ask waiting for room may let it go
 	return true
