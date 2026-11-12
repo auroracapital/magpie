@@ -3358,6 +3358,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// grown conversation is refused again, and the member that answered
 	// is asked first (#3453)
 	cands, pl = behindOverflow(stuck, cands, pl, len(body))
+	// a conversation past 200K isn't asked of a Claude account known to
+	// stop at it, and goes first to one known to hold more (long_context.go)
+	cands, pl = roomForLong(cands, pl, from, body)
 	// requests that came together go to as many keys or accounts as are
 	// alike for them, each counted where it goes until it ends (#5242);
 	// one kept, pinned, sealed to its account, or a new conversation
@@ -4743,7 +4746,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					tokens = estimate(req)
 				}
 			}
-			if left := withRoom(cands[i+1:], c, tokens); len(left) > 0 {
+			// a Claude account held by Claude Code's own check to 200K is
+			// short, not the model: the other accounts of it that may hold
+			// more are asked first (long_context.go)
+			short := hw.code() != http.StatusRequestEntityTooLarge && shortContextRefusal(c, hw.code(), hw.errBody(), tokens)
+			if short {
+				noteShortContext(c)
+			}
+			left := withRoom(cands[i+1:], c, tokens)
+			if short {
+				left = longerThan(cands[i+1:], c, tokens)
+			}
+			if len(left) > 0 {
+				if short {
+					log.Printf("claude: %s holds a conversation to 200K; the ~%dK-token conversation goes to the next of %d that may hold it", c.label(), tokens/1000, len(left))
+				}
 				if other == nil {
 					other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 				}
@@ -4754,8 +4771,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					// the conversation is remembered what this model
 					// refused as too long, to ask it last next time
 					// (#3453); a byte cap (413 above) isn't the
-					// conversation too long for the model, and isn't one
-					noteOverflow(stuck, c, len(body))
+					// conversation too long for the model, and isn't one;
+					// nor is one account's own limit (short)
+					if !short {
+						noteOverflow(stuck, c, len(body))
+					}
 				}
 				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 				skipped = append(skipped, c.label()+": "+call.Error)
@@ -5423,6 +5443,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 		} else if call.Status < 400 {
 			servedCandidate(c, call.Usage.Input+call.Usage.Output+call.Usage.CacheRead+call.Usage.CacheWrite)
+			// a Claude account that answered past 200K holds long context
+			noteLongContext(c, call.Usage.Input+call.Usage.CacheRead+call.Usage.CacheWrite)
 			// a thinking reply that went on to an answer is one more in the
 			// row that trusts the member's reasoning as it comes
 			// (holdsThinking, #4512); one whose filter's content_filter
